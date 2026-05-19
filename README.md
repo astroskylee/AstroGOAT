@@ -1,7 +1,5 @@
 # SCOPE
 
-## About
-
 SCOPE stands for **Space-telescope Color Optimization and Processing Engine**.
 
 Color-image composition tools for astronomical observations.
