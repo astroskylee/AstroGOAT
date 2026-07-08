@@ -52,7 +52,17 @@ def _rgb_bands(fits_paths, rgb):
     return bands
 
 
-def Euclidimg(ra, dec, size, path, cred, output_jpg="Euclid_color.jpg", ReplaceL=True, RGB="auto"):
+def Euclidimg(
+    ra,
+    dec,
+    size,
+    path,
+    cred,
+    output_jpg="Euclid_color.jpg",
+    ReplaceL=True,
+    RGB="auto",
+    reference_ROI=None,
+):
     """Download Euclid FITS cutouts and render one color JPEG."""
 
     from Download_Euclid import EUC_download
@@ -65,6 +75,7 @@ def Euclidimg(ra, dec, size, path, cred, output_jpg="Euclid_color.jpg", ReplaceL
         [fits_paths[band] for band in rgb_bands],
         output_jpg=jpg_path,
         input_mode="raw",
-        config=ComposeConfig(replace_luminance=bool(ReplaceL)),
+        ReplaceL=ReplaceL,
+        reference_ROI=reference_ROI,
     )
     return {"fits": fits_paths, "jpg": jpg_path, "rgb_bands": rgb_bands}

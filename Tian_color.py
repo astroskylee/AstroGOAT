@@ -93,7 +93,7 @@ Design note:
   which is the behavior that matched the PI reference best in our tests.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -212,7 +212,10 @@ def load_fits_image_raw(path: Path) -> np.ndarray:
 
 
 def normalize_raw_channels_common(
-    red: np.ndarray, green: np.ndarray, blue: np.ndarray
+    red: np.ndarray,
+    green: np.ndarray,
+    blue: np.ndarray,
+    reference_channels: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Apply one shared linear scale factor to three raw FITS channels.
@@ -226,7 +229,7 @@ def normalize_raw_channels_common(
 
     Formula:
 
-        s = 1 / max( max(R_raw), max(G_raw), max(B_raw) )
+        s = 1 / max( max(R_ref), max(G_ref), max(B_ref) )
 
         R_lin = min( s * R_raw, 1 )
         G_lin = min( s * G_raw, 1 )
@@ -247,7 +250,14 @@ def normalize_raw_channels_common(
     if red.shape != green.shape or red.shape != blue.shape:
         raise ValueError(f"Input image shapes do not match: {red.shape}, {green.shape}, {blue.shape}")
 
-    peak = max(float(np.nanmax(red)), float(np.nanmax(green)), float(np.nanmax(blue)))
+    ref_red, ref_green, ref_blue = reference_channels or (red, green, blue)
+    if ref_red.shape != ref_green.shape or ref_red.shape != ref_blue.shape:
+        raise ValueError(
+            f"Reference channel shapes do not match: red={ref_red.shape}, "
+            f"green={ref_green.shape}, blue={ref_blue.shape}"
+        )
+
+    peak = max(float(np.nanmax(ref_red)), float(np.nanmax(ref_green)), float(np.nanmax(ref_blue)))
     if not np.isfinite(peak) or peak <= 0:
         zeros = np.zeros_like(red, dtype=np.float32)
         return zeros, zeros.copy(), zeros.copy(), 1.0
@@ -510,6 +520,17 @@ def save_jpeg(path: Path, image: np.ndarray, quality: int = 100) -> None:
         image_pil.save(path, format="JPEG", quality=quality, subsampling=0)
 
 
+def save_display_image(path: Path, image: np.ndarray, jpeg_quality: int = 100) -> None:
+    """
+    Save the final display image, choosing the format from the filename suffix.
+    """
+
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        save_tiff16(path, image)
+    else:
+        save_jpeg(path, image, quality=jpeg_quality)
+
+
 def channel_avg_dev(values: np.ndarray) -> float:
     """
     Compute the average absolute deviation from the median.
@@ -624,7 +645,10 @@ def find_background_reference(image: np.ndarray) -> BackgroundReference:
 
 
 def background_neutralization(
-    rgb: np.ndarray, background: BackgroundReference, target_background: float = 0.03
+    rgb: np.ndarray,
+    background: BackgroundReference,
+    target_background: float = 0.03,
+    scale_reference_rgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """
     Equalize the RGB background components with a shared rescale if needed.
@@ -664,13 +688,20 @@ def background_neutralization(
     """
 
     shifted = rgb + (float(target_background) - background.medians.reshape(1, 1, 3))
-    peak = float(np.max(shifted))
+    scale_rgb = rgb if scale_reference_rgb is None else scale_reference_rgb
+    shifted_scale = scale_rgb + (float(target_background) - background.medians.reshape(1, 1, 3))
+    peak = float(np.max(shifted_scale))
     scale = 1.0 / peak if peak > 1.0 else 1.0
     out = shifted * scale
     return np.minimum(out, 1.0), float(scale)
 
 
-def color_calibration(rgb: np.ndarray, background: BackgroundReference, bn_scale: float) -> np.ndarray:
+def color_calibration(
+    rgb: np.ndarray,
+    background: BackgroundReference,
+    bn_scale: float,
+    stats_rgb: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Apply classic ColorCalibration using the whole image as white reference.
 
@@ -706,10 +737,11 @@ def color_calibration(rgb: np.ndarray, background: BackgroundReference, bn_scale
         I_out,c(x, y) = q * I'_c(x, y)
     """
 
-    bg_roi = roi_slice(rgb, background.rect)
+    stats = rgb if stats_rgb is None else stats_rgb
+    bg_roi = roi_slice(stats, background.rect)
     bg_level = float(np.median(bg_roi.reshape(-1, 3), axis=0)[0])
-    white_mask = (rgb > 0.0).all(axis=2) & (rgb < 0.98).all(axis=2)
-    white_mean = rgb[white_mask].mean(axis=0)
+    white_mask = (stats > 0.0).all(axis=2) & (stats < 0.98).all(axis=2)
+    white_mean = stats[white_mask].mean(axis=0)
     signal = white_mean - bg_level
     gains = np.min(signal) / signal
     global_scale = 1.0 / bn_scale
@@ -865,7 +897,11 @@ def histogram_transform(
     return np.clip(mtf(midtones, x), 0.0, 1.0)
 
 
-def linked_auto_stf_and_ht(rgb: np.ndarray, config: ComposeConfig) -> np.ndarray:
+def linked_auto_stf_and_ht(
+    rgb: np.ndarray,
+    config: ComposeConfig,
+    stats_rgb: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Apply linked STF-style auto stretch and transfer it permanently.
 
@@ -902,8 +938,9 @@ def linked_auto_stf_and_ht(rgb: np.ndarray, config: ComposeConfig) -> np.ndarray
         I_out = HT(I_in; shadows=c0, highlights=1, midtones=m)
     """
 
-    med = np.median(rgb.reshape(-1, 3), axis=0)
-    mad = np.array([madn(rgb[..., c]) for c in range(3)], dtype=np.float64)
+    stats = rgb if stats_rgb is None else stats_rgb
+    med = np.median(stats.reshape(-1, 3), axis=0)
+    mad = np.array([madn(stats[..., c]) for c in range(3)], dtype=np.float64)
     c0 = float(np.clip(np.mean(med + config.shadows_clipping * mad), 0.0, 1.0))
     m = inverse_mtf(config.target_background, float(np.mean(med) - c0))
     return histogram_transform(rgb, shadows=c0, highlights=1.0, midtones=m)
@@ -1399,7 +1436,13 @@ def color_saturation_hsvl(rgb: np.ndarray, amount: float) -> np.ndarray:
     return np.clip(hsvl_to_rgb(h, s_out, v, l), 0.0, 1.0)
 
 
-def compose_pipeline(red: np.ndarray, green: np.ndarray, blue: np.ndarray, config: ComposeConfig | None = None) -> dict[str, np.ndarray]:
+def compose_pipeline(
+    red: np.ndarray,
+    green: np.ndarray,
+    blue: np.ndarray,
+    config: ComposeConfig | None = None,
+    reference_rgb: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     """
     Run the full RGB processing pipeline and return all named outputs.
 
@@ -1421,10 +1464,33 @@ def compose_pipeline(red: np.ndarray, green: np.ndarray, blue: np.ndarray, confi
         raise ValueError(f"Input image shapes do not match: {red.shape}, {green.shape}, {blue.shape}")
 
     rgb = np.stack([red, green, blue], axis=-1)
-    background = find_background_reference(rgb)
-    bn, bn_scale = background_neutralization(rgb, background, target_background=config.bn_target_background)
-    cc = color_calibration(bn, background, bn_scale)
-    stfht = linked_auto_stf_and_ht(cc, config)
+    stats_rgb = rgb if reference_rgb is None else np.asarray(reference_rgb, dtype=np.float32)
+    if stats_rgb.ndim != 3 or stats_rgb.shape[-1] != 3:
+        raise ValueError(f"reference_rgb must have shape (H, W, 3), got {stats_rgb.shape}")
+
+    background = find_background_reference(stats_rgb)
+    bn, bn_scale = background_neutralization(
+        rgb,
+        background,
+        target_background=config.bn_target_background,
+        scale_reference_rgb=stats_rgb,
+    )
+    if reference_rgb is None:
+        bn_stats = bn
+    else:
+        bn_stats, _ = background_neutralization(
+            stats_rgb,
+            background,
+            target_background=config.bn_target_background,
+        )
+    cc = color_calibration(bn, background, bn_scale, stats_rgb=bn_stats)
+    cc_stats = cc if reference_rgb is None else color_calibration(
+        bn_stats,
+        background,
+        bn_scale,
+        stats_rgb=bn_stats,
+    )
+    stfht = linked_auto_stf_and_ht(cc, config, stats_rgb=cc_stats)
     blue_channel = stfht[..., 2]
     lab_l, lab_a, lab_b = rgb_to_lab(stfht)
     if config.replace_luminance:
@@ -1527,6 +1593,38 @@ def compose_asinh_pipeline(
 FITS_SUFFIXES = {".fits", ".fit", ".fts"}
 
 
+def _center_reference_channels(
+    red: np.ndarray,
+    green: np.ndarray,
+    blue: np.ndarray,
+    reference_ROI: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """
+    Return a centered square reference ROI for estimating display parameters.
+    """
+
+    if reference_ROI is None:
+        return None
+    if isinstance(reference_ROI, bool) or not isinstance(reference_ROI, int):
+        raise TypeError("reference_ROI must be an integer pixel size or None.")
+    if reference_ROI <= 0:
+        raise ValueError("reference_ROI must be a positive integer.")
+
+    height, width = red.shape
+    if reference_ROI > height or reference_ROI > width:
+        raise ValueError(f"reference_ROI={reference_ROI} is larger than the image shape {red.shape}.")
+
+    y0 = (height - reference_ROI) // 2
+    x0 = (width - reference_ROI) // 2
+    y1 = y0 + reference_ROI
+    x1 = x0 + reference_ROI
+    return (
+        np.ascontiguousarray(red[y0:y1, x0:x1], dtype=np.float32),
+        np.ascontiguousarray(green[y0:y1, x0:x1], dtype=np.float32),
+        np.ascontiguousarray(blue[y0:y1, x0:x1], dtype=np.float32),
+    )
+
+
 class TianColorMaker:
     """
     Small convenience wrapper around the local MTF workflow.
@@ -1548,21 +1646,45 @@ class TianColorMaker:
         output_jpg: str | Path = "mtf_color.jpg",
         *,
         input_mode: str = "auto",
+        reference_ROI: int | None = None,
         jpeg_quality: int = 100,
     ) -> Path:
         red, green, blue = _split_input_rgb_channels(rgb_image)
         mode = _resolve_input_mode(red, green, blue, input_mode)
+        reference_channels = _center_reference_channels(red, green, blue, reference_ROI)
 
         if mode == "raw":
-            red_work, green_work, blue_work, _ = normalize_raw_channels_common(red, green, blue)
+            red_work, green_work, blue_work, _ = normalize_raw_channels_common(
+                red,
+                green,
+                blue,
+                reference_channels=reference_channels,
+            )
+            if reference_channels is None:
+                reference_rgb = None
+            else:
+                ref_red_work, ref_green_work, ref_blue_work, _ = normalize_raw_channels_common(*reference_channels)
+                reference_rgb = np.stack([ref_red_work, ref_green_work, ref_blue_work], axis=-1)
         else:
             red_work = np.clip(np.asarray(red, dtype=np.float32), 0.0, 1.0)
             green_work = np.clip(np.asarray(green, dtype=np.float32), 0.0, 1.0)
             blue_work = np.clip(np.asarray(blue, dtype=np.float32), 0.0, 1.0)
+            if reference_channels is None:
+                reference_rgb = None
+            else:
+                ref_red, ref_green, ref_blue = reference_channels
+                reference_rgb = np.stack(
+                    [
+                        np.clip(np.asarray(ref_red, dtype=np.float32), 0.0, 1.0),
+                        np.clip(np.asarray(ref_green, dtype=np.float32), 0.0, 1.0),
+                        np.clip(np.asarray(ref_blue, dtype=np.float32), 0.0, 1.0),
+                    ],
+                    axis=-1,
+                )
 
-        outputs = compose_pipeline(red_work, green_work, blue_work, config=self.config)
+        outputs = compose_pipeline(red_work, green_work, blue_work, config=self.config, reference_rgb=reference_rgb)
         output_path = Path(output_jpg).expanduser().resolve()
-        save_jpeg(output_path, outputs["13_final.tif"], quality=jpeg_quality)
+        save_display_image(output_path, outputs["13_final.tif"], jpeg_quality=jpeg_quality)
         return output_path
 
 
@@ -1596,7 +1718,7 @@ class TianMonoMaker:
         outputs = compose_mono_pipeline(mono_work, config=self.config)
         final_rgb = np.repeat(outputs["13_final.tif"][..., None], 3, axis=-1)
         output_path = Path(output_jpg).expanduser().resolve()
-        save_jpeg(output_path, final_rgb, quality=jpeg_quality)
+        save_display_image(output_path, final_rgb, jpeg_quality=jpeg_quality)
         return output_path
 
 
@@ -1731,33 +1853,48 @@ def mk_colorimg(
     output_jpg: str | Path = "mtf_color.jpg",
     *,
     input_mode: str = "auto",
+    ReplaceL: bool | None = None,
+    reference_ROI: int | None = None,
     config: ComposeConfig | None = None,
     jpeg_quality: int = 100,
 ) -> Path:
     """
-    Public convenience function for building one MTF color JPEG.
+    Public convenience function for building one MTF color image.
 
     Parameters
     ----------
     rgb_image
         One RGB image or three mono channels in `(R, G, B)` order.
     output_jpg
-        Path of the final JPEG to write.
+        Path of the final image to write. Use `.jpg`/`.jpeg` for JPEG or
+        `.tif`/`.tiff` for 16-bit TIFF.
     input_mode
         - `"raw"`: apply shared linear normalization before the MTF workflow
         - `"normalized"`: assume inputs are already in display-space `[0, 1]`
         - `"auto"`: treat data outside `[0, 1]` as raw
+    ReplaceL
+        If `False`, skip replacing the CIELab L* channel with the stretched
+        blue luminosity channel. If `None`, use `config.replace_luminance`
+        or the default `ComposeConfig` value.
+    reference_ROI
+        Centered square ROI size, in pixels, used to estimate raw normalization,
+        color calibration, and STF/HT stretch parameters before applying them to
+        the full image. Defaults to `None`, which estimates from the full image.
     config
         Optional `ComposeConfig` for the MTF workflow.
     jpeg_quality
-        JPEG export quality. Defaults to `100`.
+        JPEG export quality. Ignored for TIFF output. Defaults to `100`.
     """
+
+    if ReplaceL is not None:
+        config = replace(config or ComposeConfig(), replace_luminance=bool(ReplaceL))
 
     maker = TianColorMaker(config=config)
     return maker.render(
         rgb_image,
         output_jpg=output_jpg,
         input_mode=input_mode,
+        reference_ROI=reference_ROI,
         jpeg_quality=jpeg_quality,
     )
 
@@ -1771,14 +1908,15 @@ def mk_monoimg(
     jpeg_quality: int = 100,
 ) -> Path:
     """
-    Public convenience function for building one MTF grayscale JPEG.
+    Public convenience function for building one MTF grayscale image.
 
     Parameters
     ----------
     mono_image
         One mono channel as a 2D array, FITS file, or single-channel raster.
     output_jpg
-        Path of the final JPEG to write.
+        Path of the final image to write. Use `.jpg`/`.jpeg` for JPEG or
+        `.tif`/`.tiff` for 16-bit TIFF.
     input_mode
         - `"raw"`: apply linear normalization before the mono MTF workflow
         - `"normalized"`: assume input is already in display-space `[0, 1]`
@@ -1786,7 +1924,7 @@ def mk_monoimg(
     config
         Optional `ComposeConfig`; color-only fields are ignored by this path.
     jpeg_quality
-        JPEG export quality. Defaults to `100`.
+        JPEG export quality. Ignored for TIFF output. Defaults to `100`.
     """
 
     maker = TianMonoMaker(config=config)
