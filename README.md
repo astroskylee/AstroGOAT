@@ -51,6 +51,11 @@ Set `ReplaceL=False` to skip replacing the CIELab L* channel with the stretched 
 
 Set `reference_ROI=200` to estimate the raw normalization, color calibration, and STF/HT stretch from the centered `200 x 200` pixel region, then apply those settings to the full image. By default, `reference_ROI=None` estimates from the full image.
 
+For raw three-channel inputs, STCI uses one shared linear scale derived from
+the largest channel 99th percentile. This preserves relative RGB amplitudes
+while preventing a small number of saturated stars from making the target
+galaxy too dark or excessively warm.
+
 ## Single-Band MTF Image
 
 `mk_monoimg` creates one grayscale image from a single mono image. It uses the same MTF-style stretch as `mk_colorimg`, but omits RGB-only steps such as color calibration, Lab luminance replacement, SCNR, and saturation.

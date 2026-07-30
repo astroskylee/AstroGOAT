@@ -229,7 +229,8 @@ def normalize_raw_channels_common(
 
     Formula:
 
-        s = 1 / max( max(R_ref), max(G_ref), max(B_ref) )
+        p = max( P99(R_ref), P99(G_ref), P99(B_ref) )
+        s = 1 / p
 
         R_lin = min( s * R_raw, 1 )
         G_lin = min( s * G_raw, 1 )
@@ -237,6 +238,10 @@ def normalize_raw_channels_common(
 
     Notes:
     - This is a linear normalization, not a nonlinear stretch like STF/HT.
+    - The 99th percentile keeps a small number of saturated stars from setting
+      the scale for the entire image. Samples above that shared scale are
+      clipped uniformly, while relative channel amplitudes below it remain
+      unchanged.
     - Negative values are preserved after the shared scaling. This matters for
       raw FITS backgrounds: clipping negative sky fluctuations to 0 would distort
       the background distribution and can make linked STF far too aggressive.
@@ -257,7 +262,11 @@ def normalize_raw_channels_common(
             f"green={ref_green.shape}, blue={ref_blue.shape}"
         )
 
-    peak = max(float(np.nanmax(ref_red)), float(np.nanmax(ref_green)), float(np.nanmax(ref_blue)))
+    peak = max(
+        float(np.nanpercentile(ref_red, 99.0)),
+        float(np.nanpercentile(ref_green, 99.0)),
+        float(np.nanpercentile(ref_blue, 99.0)),
+    )
     if not np.isfinite(peak) or peak <= 0:
         zeros = np.zeros_like(red, dtype=np.float32)
         return zeros, zeros.copy(), zeros.copy(), 1.0
